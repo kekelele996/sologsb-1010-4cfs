@@ -1,4 +1,5 @@
 import { analyzeProject } from './braille';
+import { emptyPrinting } from './printing';
 import type { ProjectState, RuleSet, TranscriptionRule } from './types';
 
 const letters = 'abcdefghijklmnopqrstuvwxyz'.split('').map<TranscriptionRule>((letter, index) => ({
@@ -89,6 +90,7 @@ const base: ProjectState = {
   ],
   issues: [],
   versions: [],
+  printing: emptyPrinting(),
   lastCheckedAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(),
 };

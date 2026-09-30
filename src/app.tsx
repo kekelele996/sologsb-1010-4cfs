@@ -2,7 +2,21 @@ import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import {
+  buildSummary,
+  computedCellsOf,
+  manifestText,
+  measuredTotal,
+  normalizePrinting,
+  reconcileReceipt,
+  reconcileView,
+  type ReconcileView as LineReconcileView,
+  resolveConflict,
+  sampleReceipt,
+  sendToPrint,
+  LINE_CELL_CAPACITY,
+} from './printing';
+import type { HistoryState, PrintSummary, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -55,7 +69,7 @@ function loadInitialState(): ProjectState {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as ProjectState;
-      return analyzeProject(parsed);
+      return analyzeProject(normalizePrinting(parsed));
     }
   } catch {
     // 清除损坏草稿并使用内置示例。
@@ -91,6 +105,27 @@ function issueLabel(issue: ProofIssue): string {
   if (issue.severity === 'error') return '阻断';
   if (issue.severity === 'warning') return '可疑';
   return '建议';
+}
+
+function statusTitle(status: TextbookLine['status']): string {
+  switch (status) {
+    case 'unchecked': return '未检查';
+    case 'reviewed': return '已校对';
+    case 'questionable': return '待核对';
+    case 'approved': return '已批准';
+    case 'reconcile-pending': return '待对账';
+    default: return status;
+  }
+}
+
+function downloadText(filename: string, text: string): void {
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
 function Section({ title, subtitle, action, children }: { title: string; subtitle?: string; action?: ComponentChildren; children: ComponentChildren }) {
@@ -215,32 +250,48 @@ function LineCard({
   index,
   selected,
   issues,
+  view,
   onSelect,
   onChange,
   onNote,
   onStatus,
   onDelete,
+  onResolveConflict,
 }: {
   line: TextbookLine;
   index: number;
   selected: boolean;
   issues: ProofIssue[];
+  view: LineReconcileView;
   onSelect: () => void;
   onChange: (source: string) => void;
   onNote: (note: string) => void;
   onStatus: (status: TextbookLine['status']) => void;
   onDelete: () => void;
+  onResolveConflict: (lineId: string, choice: 'workbench' | 'factory') => void;
 }) {
   const unresolved = issues.filter((issue) => !issue.resolved);
   const lineIssues = unresolved.filter((issue) => issue.lineId === line.id);
+  const layout = line.layout;
+  const delta = layout ? layout.measuredCells - computedCellsOf(line) : 0;
 
   return (
-    <article class={`line-card ${selected ? 'selected' : ''}`} id={`line-card-${line.id}`} onClick={onSelect}>
+    <article class={`line-card ${selected ? 'selected' : ''} ${view.pending ? 'pending' : ''}`} id={`line-card-${line.id}`} onClick={onSelect}>
       <div class="line-gutter">
         <span>{String(index + 1).padStart(2, '0')}</span>
-        <span class={`line-status ${line.status}`} title={`状态：${line.status}`} />
+        <span class={`line-status ${line.status}`} title={`状态：${statusTitle(line.status)}`} />
+        {layout && (
+          <span class={`layout-badge ${view.stale ? 'stale' : ''} ${layout.measuredCells > LINE_CELL_CAPACITY ? 'overflow' : ''}`} title={`制版回执 · 第 ${layout.page} 页 · 实测 ${layout.measuredCells} 格${view.stale ? '（已过期）' : ''}`}>
+            P{layout.page}·{layout.measuredCells}
+          </span>
+        )}
       </div>
       <div class="line-body">
+        {view.pending && (
+          <div class="reconcile-flag">
+            {view.conflict ? '两边都改过 · 待人工挑版' : view.stale ? '制版回执已过期 · 待重新对账' : '工作台有改动 · 待对账'}
+          </div>
+        )}
         <div class="line-source">
           <textarea
             aria-label={`第 ${index + 1} 行原文`}
@@ -270,6 +321,35 @@ function LineCard({
             )
           ))}
         </div>
+        {layout && !view.stale && (
+          <div class={`layout-strip ${view.overflow ? 'overflow' : ''}`}>
+            <span>制版回执：第 <b>{layout.page}</b> 页 · 实测 <b>{layout.measuredCells}</b> 格</span>
+            <span class={delta === 0 ? '' : delta > 0 ? 'more' : 'less'}>
+              {delta === 0 ? '与工作台计算一致' : `比工作台计算${delta > 0 ? '多' : '少'} ${Math.abs(delta)} 格`}
+            </span>
+            {layout.resolved && <span class="resolved-tag">已认{layout.resolved === 'workbench' ? '工作台' : '印厂'}版</span>}
+          </div>
+        )}
+        {view.conflict && (
+          <div class="conflict-box">
+            <div class="conflict-versions">
+              <div class="conflict-version workbench">
+                <span>工作台版（原文与转写默认认这版）</span>
+                <strong>{line.source}</strong>
+                <small>{computedCellsOf(line)} 格</small>
+              </div>
+              <div class="conflict-version factory">
+                <span>印厂版（实测版面认这版）</span>
+                <strong>{layout?.factorySource ?? line.source}</strong>
+                <small>第 {layout?.page} 页 · 实测 {layout?.measuredCells} 格</small>
+              </div>
+            </div>
+            <div class="conflict-actions">
+              <md-filled-tonal-button onClick={(event: MouseEvent) => { event.stopPropagation(); onResolveConflict(line.id, 'workbench'); }}>原文认工作台版</md-filled-tonal-button>
+              <md-filled-tonal-button onClick={(event: MouseEvent) => { event.stopPropagation(); onResolveConflict(line.id, 'factory'); }}>改用印厂版原文</md-filled-tonal-button>
+            </div>
+          </div>
+        )}
         {lineIssues.length > 0 && (
           <div class="line-warnings">
             {lineIssues.slice(0, 3).map((item) => (
@@ -300,6 +380,7 @@ function EditorPanel({
   onAddLine,
   onSplitLongLines,
   onImport,
+  onResolveConflict,
 }: {
   state: ProjectState;
   onSelectLine: (id: string) => void;
@@ -310,9 +391,13 @@ function EditorPanel({
   onAddLine: () => void;
   onSplitLongLines: () => void;
   onImport: (text: string) => void;
+  onResolveConflict: (lineId: string, choice: 'workbench' | 'factory') => void;
 }) {
   const [showImport, setShowImport] = useState(false);
   const [importText, setImportText] = useState('');
+  const batch = state.printing.sentBatch;
+  const measured = measuredTotal(state);
+  const pendingCount = batch ? state.lines.filter((line) => reconcileView(line, batch).pending).length : 0;
 
   return (
     <main class="editor-panel" aria-label="逐行转录校对区">
@@ -320,7 +405,10 @@ function EditorPanel({
         <div>
           <span class="eyebrow">逐行校对</span>
           <h1>{state.title}</h1>
-          <p>{state.author} · {state.lines.length} 行 · {brailleCellCount(state)} 格</p>
+          <p>
+            {state.author} · {state.lines.length} 行 · 工作台 {brailleCellCount(state)} 格
+            {batch && measured > 0 && <> · 制版实测 {measured} 格{pendingCount > 0 && <> · <em class="pending-text">{pendingCount} 行待对账</em></>}</>}
+          </p>
         </div>
         <div class="toolbar-actions">
           <md-outlined-button onClick={() => setShowImport((value) => !value)}>导入课文</md-outlined-button>
@@ -362,11 +450,13 @@ function EditorPanel({
             index={index}
             selected={state.selectedLineId === line.id}
             issues={state.issues}
+            view={reconcileView(line, batch)}
             onSelect={() => onSelectLine(line.id)}
             onChange={(source) => onChangeLine(line.id, source)}
             onNote={(note) => onNote(line.id, note)}
             onStatus={(status) => onStatus(line.id, status)}
             onDelete={() => onDelete(line.id)}
+            onResolveConflict={onResolveConflict}
           />
         ))}
       </div>
@@ -454,8 +544,148 @@ function RuleDetailPanel({ state, onUpdateRule, onDeleteRule }: { state: Project
   );
 }
 
-function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; onSnapshot: () => void; onRestore: (version: VersionSnapshot) => void }) {
+function PrintPanel({
+  state,
+  onSend,
+  onReconcile,
+  onResolveConflict,
+  onJump,
+}: {
+  state: ProjectState;
+  onSend: () => void;
+  onReconcile: (raw: string) => { ok: true } | { ok: false; reason: string };
+  onResolveConflict: (lineId: string, choice: 'workbench' | 'factory') => void;
+  onJump: (lineId: string) => void;
+}) {
+  const { printing } = state;
+  const batch = printing.sentBatch;
+  const [receiptText, setReceiptText] = useState('');
+  const [feedback, setFeedback] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+
+  const liveSummary: PrintSummary | null = batch ? buildSummary(state, printing.lastGood?.summary.reconciledAt ?? batch.sentAt) : null;
+  const pendingLines = batch ? state.lines.filter((line) => reconcileView(line, batch).pending) : [];
+  const conflictLines = batch ? state.lines.filter((line) => reconcileView(line, batch).conflict) : [];
+  const failure = printing.lastFailure;
+
+  const submit = () => {
+    const result = onReconcile(receiptText);
+    if (result.ok) {
+      setFeedback({ kind: 'ok', text: '整批对账成功，实测格数与页码已按行号并入，断词与汇总已重算。' });
+      setReceiptText('');
+    } else {
+      setFeedback({ kind: 'error', text: result.reason });
+    }
+  };
+
   return (
+    <div class="inspector-body print-panel">
+      <div class="snapshot-callout">
+        <div>
+          <strong>送印制版与对账</strong>
+          <p>校对定稿后送印，工作台按行号登记清单；印厂回传实测格数与页码后整批对账。</p>
+        </div>
+        <md-filled-button onClick={onSend}>{batch ? '重新送印（新批次）' : '送印制版'}</md-filled-button>
+      </div>
+
+      {!batch && (
+        <div class="empty-state compact">
+          <strong>还没有送印批次</strong>
+          <p>先“送印制版”生成按行号的制版清单，之后才能并入印厂回执。</p>
+        </div>
+      )}
+
+      {batch && (
+        <>
+          <div class="print-card">
+            <div class="print-card-head">
+              <strong>当前送印批次</strong>
+              <code>{batch.id}</code>
+            </div>
+            <div class="metric-row">
+              <span>送印 {formatTime(batch.sentAt)}</span>
+              <span>{batch.manifest.length} 行</span>
+            </div>
+            <div class="issue-actions">
+              <md-text-button onClick={() => downloadText(`${state.title.replace(/[^\p{L}\p{N}-]+/gu, '-')}-制版清单.txt`, manifestText(state))}>下载制版清单</md-text-button>
+              <md-text-button onClick={() => setReceiptText(sampleReceipt(state))}>填入演示回执</md-text-button>
+            </div>
+          </div>
+
+          {liveSummary && liveSummary.lineCount > 0 && (
+            <div class="print-card summary">
+              <strong>实测版面汇总</strong>
+              <div class="metric-row">
+                <span>{liveSummary.lineCount} 行并入</span>
+                <span>{liveSummary.measuredCells} 格</span>
+                <span>{liveSummary.pages.length} 页</span>
+              </div>
+              <div class="page-rows">
+                {liveSummary.pages.map((page) => (
+                  <span key={page.page} class="page-chip">第 {page.page} 页 · {page.lines} 行 · {page.measuredCells} 格</span>
+                ))}
+              </div>
+              {(liveSummary.overflowCount > 0 || liveSummary.conflictCount > 0) && (
+                <div class="metric-row warning-row">
+                  {liveSummary.overflowCount > 0 && <span>⚠ {liveSummary.overflowCount} 行实测超 {LINE_CELL_CAPACITY} 格</span>}
+                  {liveSummary.conflictCount > 0 && <span>✶ {liveSummary.conflictCount} 行两边都改过</span>}
+                </div>
+              )}
+            </div>
+          )}
+
+          {failure && (
+            <div class="print-failure">
+              <strong>整批对账失败 · 已保留上一版</strong>
+              <p>{failure.reason}</p>
+              <small>{formatTime(failure.at)} · 请让印厂修正后重试，不会并入任何重复行。</small>
+            </div>
+          )}
+
+          {conflictLines.length > 0 && (
+            <div class="print-card conflicts">
+              <strong>两边都动过的行（{conflictLines.length}）</strong>
+              {conflictLines.map((line) => {
+                const index = state.lines.findIndex((item) => item.id === line.id);
+                return (
+                  <div class="conflict-mini" key={line.id}>
+                    <button class="conflict-jump" onClick={() => onJump(line.id)}>第 {index + 1} 行 · {line.source.slice(0, 18)}…</button>
+                    <div class="issue-actions">
+                      <md-text-button onClick={() => onResolveConflict(line.id, 'workbench')}>认工作台</md-text-button>
+                      <md-text-button onClick={() => onResolveConflict(line.id, 'factory')}>认印厂</md-text-button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {pendingLines.length > 0 && conflictLines.length === 0 && (
+            <div class="print-note">{pendingLines.length} 行待对账：工作台改过原文或规则，等印厂重出回执。</div>
+          )}
+
+          <div class="print-card">
+            <strong>并入印厂回执</strong>
+            <p class="print-hint">JSON 或每行“行号 格数 页码”文本；整批校验通过才并入，失败则整批退回。</p>
+            <md-outlined-text-field
+              type="textarea"
+              rows={6}
+              value={receiptText}
+              label="粘贴制版回执"
+              onInput={(event: any) => { setReceiptText(event.currentTarget.value); setFeedback(null); }}
+            />
+            <div class="issue-actions">
+              <md-text-button onClick={() => { setReceiptText(''); setFeedback(null); }}>清空</md-text-button>
+              <md-filled-button disabled={!receiptText.trim()} onClick={submit}>整批对账</md-filled-button>
+            </div>
+            {feedback && <div class={`print-feedback ${feedback.kind}`}>{feedback.text}</div>}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; onSnapshot: () => void; onRestore: (version: VersionSnapshot) => void }) {  return (
     <div class="inspector-body">
       <div class="snapshot-callout">
         <div><strong>本地版本记录</strong><p>保存当前规则、原文、状态和备注的完整快照。</p></div>
@@ -481,7 +711,7 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
 
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
-  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'print' | 'versions'>('issues');
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
 
@@ -489,6 +719,10 @@ export default function App() {
   const unresolvedCount = state.issues.filter((issue) => !issue.resolved).length;
   const approvedCount = state.lines.filter((line) => line.status === 'approved').length;
   const progress = state.lines.length ? Math.round((approvedCount / state.lines.length) * 100) : 0;
+  const activeBatch = state.printing.sentBatch;
+  const reconcilePendingCount = activeBatch
+    ? state.lines.filter((line) => reconcileView(line, activeBatch).pending).length
+    : 0;
 
   const selectLine = (lineId: string, scroll = false) => {
     commit('切换当前行', (current) => ({ ...current, selectedLineId: lineId }));
@@ -561,6 +795,27 @@ export default function App() {
 
   const recordVersion = (action = '手动记录') => {
     commit('记录版本快照', (current) => ({ ...current, versions: [createSnapshot(action, current), ...current.versions].slice(0, 20), updatedAt: new Date().toISOString() }));
+  };
+
+  const sendForPrint = () => {
+    commit('送印制版登记清单', (current) => analyzeProject(sendToPrint(analyzeProject(current), new Date().toISOString())));
+  };
+
+  const reconcilePrintReceipt = (raw: string): { ok: true } | { ok: false; reason: string } => {
+    let outcome: { ok: true } | { ok: false; reason: string } = { ok: false, reason: '未执行对账。' };
+    commit('并入印厂制版回执', (current) => {
+      const result = reconcileReceipt(analyzeProject(current), raw, new Date().toISOString());
+      outcome = result.ok ? { ok: true } : { ok: false, reason: result.reason };
+      // 成功：带着新回执重跑分析（断词/超格/汇总随实测格数重算）；失败：原样保住上一版。
+      return result.ok ? analyzeProject(result.state) : result.state;
+    });
+    return outcome;
+  };
+
+  const chooseConflictVersion = (lineId: string, choice: 'workbench' | 'factory') => {
+    commit(choice === 'workbench' ? '挑版：认工作台原文' : '挑版：改用印厂原文', (current) =>
+      analyzeProject(resolveConflict(analyzeProject(current), lineId, choice, new Date().toISOString())),
+    );
   };
 
   const exportText = () => {
@@ -640,6 +895,7 @@ export default function App() {
         </div>
         <div class="status-stat warning"><strong>{unresolvedCount}</strong><span>未处理问题</span></div>
         <div class="status-stat"><strong>{state.lines.filter((line) => line.status === 'questionable').length}</strong><span>待核对行</span></div>
+        <div class={`status-stat ${reconcilePendingCount > 0 ? 'reconcile' : ''}`}><strong>{reconcilePendingCount}</strong><span>待对账行</span></div>
         <div class="status-stat"><strong>{activeRuleSet.rules.filter((rule) => rule.enabled).length}</strong><span>启用规则</span></div>
         <div class="shortcut-hint">快捷键：⌘/Ctrl Z 撤销 · ⇧⌘/Ctrl Z 重做 · ⌘/Ctrl Enter 批准并下一行 · J/K 切换行</div>
       </div>
@@ -684,12 +940,14 @@ export default function App() {
             return analyzeProject({ ...current, lines });
           })}
           onImport={importCourse}
+          onResolveConflict={chooseConflictVersion}
         />
 
         <aside class="right-panel">
-          <div class="inspector-tabs" role="tablist">
+          <div class="inspector-tabs four" role="tablist">
             <button class={inspectorTab === 'issues' ? 'active' : ''} onClick={() => setInspectorTab('issues')}>问题 {unresolvedCount > 0 && <span>{unresolvedCount}</span>}</button>
             <button class={inspectorTab === 'rules' ? 'active' : ''} onClick={() => setInspectorTab('rules')}>规则详情</button>
+            <button class={inspectorTab === 'print' ? 'active' : ''} onClick={() => setInspectorTab('print')}>制版 {reconcilePendingCount > 0 && <span>{reconcilePendingCount}</span>}</button>
             <button class={inspectorTab === 'versions' ? 'active' : ''} onClick={() => setInspectorTab('versions')}>版本 {state.versions.length > 0 && <span>{state.versions.length}</span>}</button>
           </div>
           {inspectorTab === 'issues' && (
@@ -707,9 +965,18 @@ export default function App() {
               ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: set.rules.filter((rule) => rule.id !== ruleId) } : set),
             }));
           }} />}
+          {inspectorTab === 'print' && (
+            <PrintPanel
+              state={state}
+              onSend={sendForPrint}
+              onReconcile={reconcilePrintReceipt}
+              onResolveConflict={chooseConflictVersion}
+              onJump={(lineId) => selectLine(lineId, true)}
+            />
+          )}
           {inspectorTab === 'versions' && <VersionsPanel state={state} onSnapshot={() => recordVersion()} onRestore={(version) => {
             const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
-            restore(restored);
+            restore(analyzeProject(normalizePrinting(restored)));
           }} />}
         </aside>
       </div>
