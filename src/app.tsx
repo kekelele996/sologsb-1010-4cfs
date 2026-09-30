@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import { chooseConflictVersion, computedCells, markWorkbenchChanges, reconcileReceipt, sendToPlate } from './reconcile';
+import type { ReconcileOutcome } from './reconcile';
 import { createInitialProject } from './sample';
 import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
 
@@ -235,7 +237,7 @@ function LineCard({
   const lineIssues = unresolved.filter((issue) => issue.lineId === line.id);
 
   return (
-    <article class={`line-card ${selected ? 'selected' : ''}`} id={`line-card-${line.id}`} onClick={onSelect}>
+    <article class={`line-card ${selected ? 'selected' : ''} reconcile-${line.reconcileStatus}`} id={`line-card-${line.id}`} onClick={onSelect}>
       <div class="line-gutter">
         <span>{String(index + 1).padStart(2, '0')}</span>
         <span class={`line-status ${line.status}`} title={`状态：${line.status}`} />
@@ -270,6 +272,13 @@ function LineCard({
             )
           ))}
         </div>
+        <div class="reconcile-chips">
+          {line.reconcileStatus === 'pending' && <span class="reconcile-chip pending" title="工作台动过原文或规则，回执数据已过期，需重新送制版对账">待对账</span>}
+          {line.reconcileStatus === 'conflict' && <span class="reconcile-chip conflict" title="两边都动过：原文转写认工作台，实测版面认回执，待挑选">冲突 · 待挑选</span>}
+          {line.reconcileStatus === 'synced' && line.plateLayout && (
+            <span class="reconcile-chip synced">实测 {line.plateLayout.cells} 格 · P{line.plateLayout.page}</span>
+          )}
+        </div>
         {lineIssues.length > 0 && (
           <div class="line-warnings">
             {lineIssues.slice(0, 3).map((item) => (
@@ -300,6 +309,7 @@ function EditorPanel({
   onAddLine,
   onSplitLongLines,
   onImport,
+  onSendToPlate,
 }: {
   state: ProjectState;
   onSelectLine: (id: string) => void;
@@ -310,9 +320,11 @@ function EditorPanel({
   onAddLine: () => void;
   onSplitLongLines: () => void;
   onImport: (text: string) => void;
+  onSendToPlate: () => void;
 }) {
   const [showImport, setShowImport] = useState(false);
   const [importText, setImportText] = useState('');
+  const report = state.reconcileReport;
 
   return (
     <main class="editor-panel" aria-label="逐行转录校对区">
@@ -320,11 +332,12 @@ function EditorPanel({
         <div>
           <span class="eyebrow">逐行校对</span>
           <h1>{state.title}</h1>
-          <p>{state.author} · {state.lines.length} 行 · {brailleCellCount(state)} 格</p>
+          <p>{state.author} · {state.lines.length} 行 · 计算 {brailleCellCount(state)} 格{report && <> · 实测 {report.totalCells} 格 · {report.totalPages} 页</>}</p>
         </div>
         <div class="toolbar-actions">
           <md-outlined-button onClick={() => setShowImport((value) => !value)}>导入课文</md-outlined-button>
           <md-outlined-button onClick={onSplitLongLines}>按句拆分</md-outlined-button>
+          <md-outlined-button onClick={onSendToPlate}>送印厂制版</md-outlined-button>
           <md-filled-button onClick={onAddLine}>新增行</md-filled-button>
         </div>
       </div>
@@ -479,11 +492,143 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
   );
 }
 
+function ReconcilePanel({
+  state,
+  showReceipt,
+  receiptText,
+  error,
+  onToggleReceipt,
+  onReceiptText,
+  onReconcile,
+  onChoose,
+}: {
+  state: ProjectState;
+  showReceipt: boolean;
+  receiptText: string;
+  error?: string;
+  onToggleReceipt: () => void;
+  onReceiptText: (text: string) => void;
+  onReconcile: () => void;
+  onChoose: (lineId: string, choice: 'workbench' | 'receipt') => void;
+}) {
+  const report = state.reconcileReport;
+
+  return (
+    <div class="inspector-body reconcile-body">
+      <div class="snapshot-callout">
+        <div>
+          <strong>送印厂制版</strong>
+          <p>把当前原文与转写快照送制版；工作台再改动的行会先标为待对账。</p>
+          <p class="reconcile-meta">最近送制版：{state.lastSentAt ? formatTime(state.lastSentAt) : '尚未送制版'}</p>
+        </div>
+      </div>
+
+      <div class="reconcile-receipt-head">
+        <div>
+          <strong>制版回执</strong>
+          <p>{state.plateReceipt ? `最近回执 ${formatTime(state.plateReceipt.receivedAt)}` : '印厂回传每行实测格数与页码后并入。'}</p>
+        </div>
+        <md-outlined-button onClick={onToggleReceipt}>{showReceipt ? '收起' : '粘贴回执'}</md-outlined-button>
+      </div>
+
+      {showReceipt && (
+        <div class="import-strip reconcile-import">
+          <md-outlined-text-field
+            type="textarea"
+            rows={6}
+            value={receiptText}
+            label="每行：行号 实测格数 页码，例如 1 24 3"
+            onInput={(event: any) => onReceiptText(event.currentTarget.value)}
+          />
+          <div>
+            <md-text-button onClick={onToggleReceipt}>取消</md-text-button>
+            <md-filled-button disabled={!receiptText.trim()} onClick={onReconcile}>整批并入对账</md-filled-button>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div class="reconcile-error">
+          <strong>整批对账失败，已保住上一版</strong>
+          <p>{error}</p>
+          <md-filled-tonal-button onClick={onToggleReceipt}>让印厂重试</md-filled-tonal-button>
+        </div>
+      )}
+
+      {report && (
+        <div class="reconcile-summary">
+          <div class="metric-row">
+            <span>实测总格数 {report.totalCells}</span>
+            <span>计算总格数 {report.computedCells}</span>
+            <span>总页码 {report.totalPages}</span>
+          </div>
+          <div class="metric-row">
+            <span class="reconcile-pill synced">已同步 {report.synced}</span>
+            <span class="reconcile-pill pending">待对账 {report.pending}</span>
+            <span class="reconcile-pill conflict">冲突 {report.conflicts}</span>
+            {report.receiptOnly > 0 && <span class="reconcile-pill receipt-only">回执独有 {report.receiptOnly}</span>}
+          </div>
+        </div>
+      )}
+
+      {report?.receiptOnly ? (
+        <p class="reconcile-drift-note">回执中有 {report.receiptOnly} 行对不上工作台行号（行号漂移），未并入也未重复建行；请按当前行号重发回执。</p>
+      ) : null}
+
+      <div class="reconcile-lines">
+        {state.lines.map((line, index) => {
+          const layout = line.plateLayout;
+          const cells = computedCells(line);
+          return (
+            <div class={`reconcile-line ${line.reconcileStatus}`} key={line.id}>
+              <div class="reconcile-line-head">
+                <span class="reconcile-line-no">{index + 1}</span>
+                <span class="reconcile-line-source">{line.source || '（空行）'}</span>
+                <span class={`reconcile-badge ${line.reconcileStatus}`}>
+                  {line.reconcileStatus === 'pending' ? '待对账' : line.reconcileStatus === 'conflict' ? '冲突' : '已同步'}
+                </span>
+              </div>
+              <div class="reconcile-line-metrics">
+                <span>工作台 {cells} 格</span>
+                <span>实测 {layout ? `${layout.cells} 格 · P${layout.page}` : '—'}</span>
+              </div>
+              {line.reconcileStatus === 'conflict' && line.receiptVersion && (
+                <div class="reconcile-conflict">
+                  <div class="conflict-version">
+                    <strong>工作台版（原文/转写）</strong>
+                    <p>{line.source}</p>
+                    <span>{cells} 格</span>
+                  </div>
+                  <div class="conflict-version">
+                    <strong>制版回执版（实测版面）</strong>
+                    <p>{line.receiptVersion.source}</p>
+                    <span>{line.receiptVersion.cells} 格 · P{line.receiptVersion.page}</span>
+                  </div>
+                  <div class="conflict-actions">
+                    <md-text-button onClick={() => onChoose(line.id, 'workbench')}>采用工作台版</md-text-button>
+                    <md-filled-tonal-button onClick={() => onChoose(line.id, 'receipt')}>采用回执实测版面</md-filled-tonal-button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
-  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions' | 'reconcile'>('issues');
+  const [showReceipt, setShowReceipt] = useState(false);
+  const [receiptText, setReceiptText] = useState('');
+  const [reconcileError, setReconcileError] = useState<string | undefined>();
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
+
+  const commitWorkbench = (label: string, update: (current: ProjectState) => ProjectState) =>
+    commit(label, (current) => markWorkbenchChanges(update(current)));
 
   const activeRuleSet = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
   const unresolvedCount = state.issues.filter((issue) => !issue.resolved).length;
@@ -496,7 +641,7 @@ export default function App() {
   };
 
   const changeLine = (lineId: string, source: string) => {
-    commit('修改课文原文', (current) => analyzeProject({ ...current, lines: current.lines.map((line) => line.id === lineId ? { ...line, source } : line) }));
+    commitWorkbench('修改课文原文', (current) => analyzeProject({ ...current, lines: current.lines.map((line) => line.id === lineId ? { ...line, source } : line) }));
   };
 
   const changeStatus = (lineId: string, status: TextbookLine['status']) => {
@@ -563,6 +708,28 @@ export default function App() {
     commit('记录版本快照', (current) => ({ ...current, versions: [createSnapshot(action, current), ...current.versions].slice(0, 20), updatedAt: new Date().toISOString() }));
   };
 
+  const handleSendToPlate = () => {
+    commit('送印厂制版', (current) => sendToPlate(current));
+    setReconcileError(undefined);
+  };
+
+  const handleReconcile = (text: string): ReconcileOutcome => {
+    const outcome = reconcileReceipt(state, text);
+    if (outcome.ok && outcome.state) {
+      commit('并入制版回执', () => outcome.state!);
+      setReconcileError(undefined);
+      setShowReceipt(false);
+      setReceiptText('');
+    } else {
+      setReconcileError(outcome.error);
+    }
+    return outcome;
+  };
+
+  const handleChooseVersion = (lineId: string, choice: 'workbench' | 'receipt') => {
+    commit('挑选对账版本', (current) => chooseConflictVersion(current, lineId, choice));
+  };
+
   const exportText = () => {
     const blob = new Blob([`${state.title}\n规则集：${activeRuleSet.name}\n\n${outputText(state)}\n`], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -584,7 +751,7 @@ export default function App() {
   };
 
   const updateRule = (ruleId: string, patch: Record<string, unknown>) => {
-    commit('修改转录规则', (current) => {
+    commitWorkbench('修改转录规则', (current) => {
       const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
       const nextSet = updateRuleInSet(ruleSet, ruleId, patch);
       return analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === nextSet.id ? nextSet : set) });
@@ -592,7 +759,7 @@ export default function App() {
   };
 
   const batchFixRule = (ruleId: string) => {
-    commit('批量修正同类问题', (current) => {
+    commitWorkbench('批量修正同类问题', (current) => {
       const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
       const nextSet = updateRuleInSet(ruleSet, ruleId, { enabled: false });
       return analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === nextSet.id ? nextSet : set) });
@@ -605,9 +772,9 @@ export default function App() {
       .split(/\n+|(?<=[.!?。！？])\s+/)
       .map((line) => line.trim())
       .filter(Boolean);
-    commit('导入课文', (current) => analyzeProject({
+    commitWorkbench('导入课文', (current) => analyzeProject({
       ...current,
-      lines: sourceLines.map((source, index) => ({ id: `line-import-${Date.now()}-${index}`, source, tokens: [], status: index === 0 ? 'questionable' : 'unchecked', note: index === 0 ? '导入后待确认规则集。' : '', continuesPrevious: false, continuesNext: false })),
+      lines: sourceLines.map((source, index) => ({ id: `line-import-${Date.now()}-${index}`, source, tokens: [], status: index === 0 ? 'questionable' : 'unchecked', note: index === 0 ? '导入后待确认规则集。' : '', continuesPrevious: false, continuesNext: false, reconcileStatus: 'synced' })),
       selectedLineId: '',
       issues: [],
     }));
@@ -647,14 +814,14 @@ export default function App() {
       <div class="workspace-grid">
         <RuleSetPanel
           state={state}
-          onSelect={(id) => commit('切换规则集并重新检查', (current) => analyzeProject({ ...current, activeRuleSetId: id, issues: [] }))}
+          onSelect={(id) => commitWorkbench('切换规则集并重新检查', (current) => analyzeProject({ ...current, activeRuleSetId: id, issues: [] }))}
           onUpdateRule={updateRule}
           onToggleContractions={() => {
             const ruleSet = activeRuleSet;
-            commit('切换缩写规则', (current) => analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === ruleSet.id ? { ...set, contractions: !set.contractions } : set) }));
+            commitWorkbench('切换缩写规则', (current) => analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === ruleSet.id ? { ...set, contractions: !set.contractions } : set) }));
           }}
           onAddRule={(source, output, suspicious) => {
-            commit('新增转写规则', (current) => analyzeProject({
+            commitWorkbench('新增转写规则', (current) => analyzeProject({
               ...current,
               ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: [...set.rules, makeRule(source, output, suspicious)] } : set),
             }));
@@ -668,15 +835,15 @@ export default function App() {
           onChangeLine={changeLine}
           onNote={(lineId, note) => commit('添加校对备注', (current) => ({ ...current, lines: current.lines.map((line) => line.id === lineId ? { ...line, note } : line) }))}
           onStatus={changeStatus}
-          onDelete={(lineId) => commit('删除课文行', (current) => {
+          onDelete={(lineId) => commitWorkbench('删除课文行', (current) => {
             const lines = current.lines.filter((line) => line.id !== lineId);
-            return analyzeProject({ ...current, lines: lines.length ? lines : [{ id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false }], selectedLineId: lines[0]?.id ?? '' });
+            return analyzeProject({ ...current, lines: lines.length ? lines : [{ id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false, reconcileStatus: 'synced' }], selectedLineId: lines[0]?.id ?? '' });
           })}
-          onAddLine={() => commit('新增课文行', (current) => {
-            const line: TextbookLine = { id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false };
+          onAddLine={() => commitWorkbench('新增课文行', (current) => {
+            const line: TextbookLine = { id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false, reconcileStatus: 'synced' };
             return analyzeProject({ ...current, lines: [...current.lines, line], selectedLineId: line.id });
           })}
-          onSplitLongLines={() => commit('按句拆分长行', (current) => {
+          onSplitLongLines={() => commitWorkbench('按句拆分长行', (current) => {
             const lines = current.lines.flatMap((line) => line.source
               .split(/(?<=[.!?。！？])\s+|;\s*/)
               .filter((part) => part.trim())
@@ -684,6 +851,7 @@ export default function App() {
             return analyzeProject({ ...current, lines });
           })}
           onImport={importCourse}
+          onSendToPlate={handleSendToPlate}
         />
 
         <aside class="right-panel">
@@ -691,6 +859,9 @@ export default function App() {
             <button class={inspectorTab === 'issues' ? 'active' : ''} onClick={() => setInspectorTab('issues')}>问题 {unresolvedCount > 0 && <span>{unresolvedCount}</span>}</button>
             <button class={inspectorTab === 'rules' ? 'active' : ''} onClick={() => setInspectorTab('rules')}>规则详情</button>
             <button class={inspectorTab === 'versions' ? 'active' : ''} onClick={() => setInspectorTab('versions')}>版本 {state.versions.length > 0 && <span>{state.versions.length}</span>}</button>
+            <button class={inspectorTab === 'reconcile' ? 'active' : ''} onClick={() => setInspectorTab('reconcile')}>
+              对账 {((state.reconcileReport?.pending ?? 0) + (state.reconcileReport?.conflicts ?? 0)) > 0 && <span>{(state.reconcileReport?.pending ?? 0) + (state.reconcileReport?.conflicts ?? 0)}</span>}
+            </button>
           </div>
           {inspectorTab === 'issues' && (
             <IssuesPanel
@@ -711,6 +882,18 @@ export default function App() {
             const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
             restore(restored);
           }} />}
+          {inspectorTab === 'reconcile' && (
+            <ReconcilePanel
+              state={state}
+              showReceipt={showReceipt}
+              receiptText={receiptText}
+              error={reconcileError}
+              onToggleReceipt={() => { setShowReceipt((value) => !value); setReconcileError(undefined); }}
+              onReceiptText={setReceiptText}
+              onReconcile={() => handleReconcile(receiptText)}
+              onChoose={handleChooseVersion}
+            />
+          )}
         </aside>
       </div>
     </div>
